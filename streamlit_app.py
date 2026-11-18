@@ -1,56 +1,85 @@
-import json
-import os
-import threading
-import time
-import uuid
-
-import av
-import cv2
 import streamlit as st
-import streamlit.components.v1 as components
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
+import cv2
+import av
+import time
 from ultralytics import YOLO
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
-
-# ============================================================
-# PAGE SETTINGS
-# ============================================================
+# =========================
+# PAGE CONFIGURATION
+# =========================
 
 st.set_page_config(
     page_title="VisionGuide AI",
     page_icon="👁️",
-    layout="wide",
+    layout="wide"
 )
 
-st.markdown(
-    """
-    <style>
-    .vg-title {font-size: 2.1rem; font-weight: 800; margin-bottom: 0;}
-    .vg-subtitle {color: #8b949e; margin-top: 0.2rem; margin-bottom: 1.2rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# =========================
+# CUSTOM DESIGN
+# =========================
 
-st.markdown('<div class="vg-title">👁️ VisionGuide AI</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="vg-subtitle">AI-powered object detection assistant</div>',
-    unsafe_allow_html=True,
-)
-st.divider()
+st.markdown("""
+<style>
+.stApp {
+    background-color: #0e1117;
+}
 
+.main-title {
+    font-size: 42px;
+    font-weight: 800;
+    color: #ffffff;
+}
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+.subtitle {
+    color: #aab4c3;
+    font-size: 18px;
+}
 
-MODEL_PATH = os.getenv("VISIONGUIDE_MODEL", "yolo26s.pt")
-IMAGE_SIZE = 640
-CONFIDENCE = 0.25
-VOICE_COOLDOWN = 6
+.info-box {
+    background-color: #202b40;
+    padding: 18px;
+    border-radius: 12px;
+    color: #dbeafe;
+}
 
-# Keep this list focused on common, larger objects.
-TARGET_OBJECTS = {
+.warning-box {
+    background-color: #3a3018;
+    padding: 15px;
+    border-radius: 10px;
+    color: #ffd966;
+}
+
+.detected-box {
+    background-color: #172b22;
+    padding: 12px;
+    border-radius: 10px;
+    margin-bottom: 8px;
+    color: #b7f7cd;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# LOAD YOLO MODEL
+# =========================
+
+@st.cache_resource
+def load_model():
+    return YOLO("yolo26s.pt")
+
+try:
+    model = load_model()
+    model_loaded = True
+except Exception as e:
+    model_loaded = False
+    st.error(f"Model loading error: {e}")
+
+# =========================
+# OBJECT DETECTION
+# =========================
+
+TARGET_OBJECTS = [
     "person",
     "chair",
     "couch",
@@ -61,292 +90,214 @@ TARGET_OBJECTS = {
     "truck",
     "bench",
     "suitcase",
-    "dining table",
-}
+    "dining table"
+]
 
-# Browser speech is generated from these short, camera-relative messages.
-# It does not estimate distance, motion, or whether a route is safe.
+class VisionProcessor(VideoProcessorBase):
 
-
-# ============================================================
-# LOAD MODEL ONCE PER SERVER
-# ============================================================
-
-@st.cache_resource(show_spinner="Loading VisionGuide AI model...")
-def load_model(model_path: str):
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Model file '{model_path}' was not found. "
-            "Add the model file to the deployed app or configure VISIONGUIDE_MODEL."
-        )
-    return YOLO(model_path)
-
-
-try:
-    model = load_model(MODEL_PATH)
-except Exception as exc:
-    st.error(f"Could not load the AI model: {exc}")
-    st.info(
-        "Check that the model file is included in your deployment and that "
-        "requirements.txt contains ultralytics."
-    )
-    st.stop()
-
-
-# ============================================================
-# VIDEO PROCESSOR
-# ============================================================
-
-class VisionGuideProcessor:
-    """Runs YOLO on frames received from the visitor's browser camera."""
-
-    def __init__(self, yolo_model):
-        self.model = yolo_model
-        self.lock = threading.Lock()
+    def __init__(self):
+        self.model = model
+        self.last_detection_time = 0
         self.detections = []
-        self.last_announcement = ""
-        self.announcement_id = ""
-        self.last_announced_at = {}
-        self.frame_number = 0
-        self.error = ""
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+    def recv(self, frame):
+
         image = frame.to_ndarray(format="bgr24")
-        self.frame_number += 1
 
-        # Process every second frame to reduce server load.
-        if self.frame_number % 2 == 0:
-            try:
-                results = self.model.predict(
-                    image,
-                    imgsz=IMAGE_SIZE,
-                    conf=CONFIDENCE,
-                    verbose=False,
-                    device="cpu",
+        results = self.model.predict(
+            image,
+            imgsz=640,
+            conf=0.30,
+            verbose=False
+        )
+
+        annotated = image.copy()
+        detected_objects = []
+
+        for result in results:
+
+            boxes = result.boxes
+
+            if boxes is None:
+                continue
+
+            for box in boxes:
+
+                class_id = int(box.cls[0])
+                confidence = float(box.conf[0])
+
+                name = self.model.names[class_id]
+
+                if name not in TARGET_OBJECTS:
+                    continue
+
+                x1, y1, x2, y2 = map(
+                    int,
+                    box.xyxy[0]
                 )
 
-                current_detections = []
-                announcement_parts = []
-                now = time.time()
+                detected_objects.append(name)
 
-                for result in results:
-                    for box in result.boxes:
-                        class_id = int(box.cls[0])
-                        name = self.model.names[class_id]
+                # Draw bounding box
+                cv2.rectangle(
+                    annotated,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 100),
+                    3
+                )
 
-                        if name not in TARGET_OBJECTS:
-                            continue
+                label = f"{name} {confidence:.0%}"
 
-                        confidence = float(box.conf[0])
-                        x1, y1, x2, y2 = map(
-                            int, box.xyxy[0].tolist()
-                        )
+                cv2.putText(
+                    annotated,
+                    label,
+                    (x1, max(y1 - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 100),
+                    2
+                )
 
-                        # Ignore very small boxes to reduce noisy alerts.
-                        box_area = max(0, x2 - x1) * max(0, y2 - y1)
-                        frame_area = image.shape[0] * image.shape[1]
-                        if box_area < frame_area * 0.015:
-                            continue
+        self.detections = list(set(detected_objects))
 
-                        center_x = (x1 + x2) / 2
+        return av.VideoFrame.from_ndarray(
+            annotated,
+            format="bgr24"
+        )
 
-                        if center_x < image.shape[1] / 3:
-                            position = "left"
-                        elif center_x > image.shape[1] * 2 / 3:
-                            position = "right"
-                        else:
-                            position = "centre"
+# =========================
+# HEADER
+# =========================
 
-                        current_detections.append(
-                            {
-                                "name": name,
-                                "position": position,
-                                "confidence": round(confidence, 2),
-                            }
-                        )
+st.markdown(
+    '<div class="main-title">👁️ VisionGuide AI</div>',
+    unsafe_allow_html=True
+)
 
-                        cv2.rectangle(
-                            image, (x1, y1), (x2, y2), (0, 220, 90), 2
-                        )
-                        label = f"{name} {confidence:.2f} - {position}"
-                        cv2.putText(
-                            image,
-                            label,
-                            (x1, max(24, y1 - 9)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            (0, 220, 90),
-                            2,
-                        )
+st.markdown(
+    '<div class="subtitle">AI-powered visual assistance prototype</div>',
+    unsafe_allow_html=True
+)
 
-                        key = (name, position)
-                        previous = self.last_announced_at.get(key, 0)
-                        if now - previous >= VOICE_COOLDOWN:
-                            announcement_parts.append(
-                                f"{name} detected on the {position}"
-                            )
-                            self.last_announced_at[key] = now
+st.divider()
 
-                # Avoid repeating the same object-position multiple times
-                # in one spoken announcement.
-                announcement_parts = list(dict.fromkeys(announcement_parts))[:3]
+# =========================
+# PRIVACY WARNING
+# =========================
 
-                with self.lock:
-                    self.detections = current_detections
-                    self.error = ""
+st.markdown("""
+<div class="warning-box">
+⚠️ <b>Privacy Notice:</b> Camera images are sent to the VisionGuide server
+for AI processing. Start the camera only if you agree.
+<br><br>
+This is an experimental prototype. Do not rely on it for navigation or safety.
+</div>
+""", unsafe_allow_html=True)
 
-                    if announcement_parts:
-                        self.last_announcement = ". ".join(announcement_parts) + "."
-                        self.announcement_id = str(uuid.uuid4())
+st.write("")
 
-            except Exception as exc:
-                with self.lock:
-                    self.error = str(exc)
-
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
-
-    def snapshot(self):
-        with self.lock:
-            return (
-                list(self.detections),
-                self.last_announcement,
-                self.announcement_id,
-                self.error,
-            )
-
-
-# ============================================================
-# BROWSER SPEECH
-# ============================================================
-
-def speak_in_browser(message: str, event_id: str):
-    """Speak a new announcement in the visitor's browser, not on the server."""
-    safe_message = json.dumps(message)
-    safe_event_id = json.dumps(event_id)
-
-    html = f"""
-    <script>
-    const message = {safe_message};
-    const eventId = {safe_event_id};
-
-    if (message && eventId && "speechSynthesis" in window) {{
-        const storageKey = "visionguide_last_spoken_event";
-        let previousEvent = "";
-        try {{
-            previousEvent = window.localStorage.getItem(storageKey) || "";
-        }} catch (e) {{}}
-
-        if (eventId !== previousEvent) {{
-            try {{
-                window.localStorage.setItem(storageKey, eventId);
-            }} catch (e) {{}}
-
-            window.speechSynthesis.cancel();
-            const utterance = new SpeechSynthesisUtterance(message);
-            utterance.lang = "en-US";
-            utterance.rate = 1;
-            utterance.pitch = 1;
-            window.speechSynthesis.speak(utterance);
-        }}
-    }}
-    </script>
-    """
-    components.html(html, height=0, width=0)
-
-
-# ============================================================
-# LIVE CAMERA
-# ============================================================
+# =========================
+# CAMERA SECTION
+# =========================
 
 st.subheader("📷 Live Camera")
 
-st.warning(
-    "Camera images are sent from your browser to the VisionGuide server "
-    "for AI processing. Start the camera only if you agree to this."
-)
+if not model_loaded:
 
-ctx = webrtc_streamer(
-    key="visionguide-live-camera",
-    mode=WebRtcMode.SENDRECV,
-    video_processor_factory=lambda: VisionGuideProcessor(model),
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-    desired_playing_state=True,
-)
+    st.error("YOLO model could not be loaded.")
 
-st.caption(
-    "Allow camera permission in your browser. Use the Start button in the "
-    "camera panel to begin and Stop to pause."
-)
+else:
 
+    rtc_configuration = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
 
-# ============================================================
-# DASHBOARD / LIVE RESULTS
-# ============================================================
+    camera = webrtc_streamer(
+        key="visionguide-camera",
+        video_processor_factory=VisionProcessor,
+        rtc_configuration=rtc_configuration,
+        media_stream_constraints={
+            "video": True,
+            "audio": False
+        },
+        async_processing=False
+    )
 
-@st.fragment(run_every=0.5)
-def live_dashboard():
-    left, right = st.columns([2, 1], gap="large")
-
-    processor = ctx.video_processor if ctx.state.playing else None
-
-    with left:
-        st.subheader("Detection Preview")
-        if ctx.state.playing:
-            st.success("Camera connected")
-            st.caption("The live annotated camera feed appears in the camera panel above.")
-        else:
-            st.info("Camera is stopped. Start the camera in the panel above.")
-
-    with right:
-        st.subheader("System Status")
-        if ctx.state.playing and processor is not None:
-            st.success("VisionGuide is processing camera frames")
-        elif ctx.state.signalling:
-            st.info("Connecting to camera...")
-        else:
-            st.warning("Camera is not running")
-
-        st.divider()
-        st.subheader("🔊 Voice Assistant")
-        st.write("Browser voice announcements: Enabled")
-        st.caption("Uses the visitor's browser speech engine.")
-
-        st.divider()
-        st.subheader("Detected Objects")
-
-        if processor is None:
-            st.caption("No active camera stream.")
-            return
-
-        detections, announcement, announcement_id, processor_error = processor.snapshot()
-
-        if processor_error:
-            st.error(f"Detection error: {processor_error}")
-
-        if detections:
-            for item in detections:
-                st.write(
-                    f"**{item['name'].title()}**"
-                    f" · {item['position'].title()}"
-                    f" · {item['confidence']:.0%}"
-                )
-        else:
-            st.caption("No selected objects detected in the latest processed frame.")
-
-        if announcement and announcement_id:
-            speak_in_browser(announcement, announcement_id)
-
-        st.divider()
-        st.caption(f"Selected object classes: {len(TARGET_OBJECTS)}")
-        st.caption(f"Detection image size: {IMAGE_SIZE}px")
-
-
-live_dashboard()
+# =========================
+# DETECTION INFORMATION
+# =========================
 
 st.divider()
-st.caption(
-    "VisionGuide AI is an experimental object-detection prototype. "
-    "It cannot measure distance, reliably detect every hazard, or determine "
-    "whether a path is safe. Do not rely on it for navigation."
-)
+
+col1, col2 = st.columns([2, 1])
+
+with col1:
+
+    st.subheader("🔍 Detection Information")
+
+    if model_loaded and camera.video_processor:
+
+        detections = camera.video_processor.detections
+
+        if detections:
+
+            for item in detections:
+
+                st.markdown(
+                    f"""
+                    <div class="detected-box">
+                    🟢 <b>{item.capitalize()}</b> detected
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+        else:
+
+            st.info(
+                "No target objects detected currently."
+            )
+
+    else:
+
+        st.info(
+            "Start the camera to begin object detection."
+        )
+
+with col2:
+
+    st.subheader("⚙️ System Status")
+
+    if model_loaded:
+
+        st.success("YOLO Model Loaded")
+
+    else:
+
+        st.error("Model Not Loaded")
+
+    if camera.state.playing:
+
+        st.success("Camera Running")
+
+    else:
+
+        st.info("Camera Stopped")
+
+    st.caption(
+        "Detection runs on the server."
+    )
+
+# =========================
+# FOOTER
+# =========================
+
+st.divider()
+
+st.caption("""
+VisionGuide AI | Experimental AI visual assistance prototype
+
+Not a replacement for a cane, guide dog, trained mobility assistance,
+or human assistance. Detection can be incorrect or delayed.
+""")
