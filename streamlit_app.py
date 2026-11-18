@@ -2,12 +2,14 @@ import streamlit as st
 import cv2
 import av
 import time
+import threading
+from collections import deque
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
-# =========================
-# PAGE CONFIGURATION
-# =========================
+# ==================================================
+# PAGE SETTINGS
+# ==================================================
 
 st.set_page_config(
     page_title="VisionGuide AI",
@@ -15,160 +17,262 @@ st.set_page_config(
     layout="wide"
 )
 
-# =========================
-# CUSTOM DESIGN
-# =========================
+# ==================================================
+# CONFIGURATION
+# ==================================================
 
-st.markdown("""
-<style>
-.stApp {
-    background-color: #0e1117;
-}
+MODEL_PATH = "yolo26s.pt"
+IMAGE_SIZE = 640
+CONFIDENCE = 0.25
+VOICE_COOLDOWN = 6
 
-.main-title {
-    font-size: 42px;
-    font-weight: 800;
-    color: #ffffff;
-}
-
-.subtitle {
-    color: #aab4c3;
-    font-size: 18px;
-}
-
-.info-box {
-    background-color: #202b40;
-    padding: 18px;
-    border-radius: 12px;
-    color: #dbeafe;
-}
-
-.warning-box {
-    background-color: #3a3018;
-    padding: 15px;
-    border-radius: 10px;
-    color: #ffd966;
-}
-
-.detected-box {
-    background-color: #172b22;
-    padding: 12px;
-    border-radius: 10px;
-    margin-bottom: 8px;
-    color: #b7f7cd;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================
-# LOAD YOLO MODEL
-# =========================
+# ==================================================
+# LOAD MODEL
+# ==================================================
 
 @st.cache_resource
 def load_model():
-    return YOLO("yolo26s.pt")
+    return YOLO(MODEL_PATH)
 
-try:
-    model = load_model()
-    model_loaded = True
-except Exception as e:
-    model_loaded = False
-    st.error(f"Model loading error: {e}")
+model = load_model()
 
-# =========================
-# OBJECT DETECTION
-# =========================
+TARGET_OBJECTS = set(model.names.values())
 
-TARGET_OBJECTS = [
-    "person",
-    "chair",
-    "couch",
-    "bicycle",
-    "car",
-    "motorcycle",
-    "bus",
-    "truck",
-    "bench",
-    "suitcase",
-    "dining table"
-]
+# ==================================================
+# VISIONGUIDE PROCESSOR
+# ==================================================
 
-class VisionProcessor(VideoProcessorBase):
+class VisionGuideProcessor(VideoProcessorBase):
 
     def __init__(self):
-        self.model = model
-        self.last_detection_time = 0
+
+        self.lock = threading.Lock()
+
         self.detections = []
+        self.speech_queue = deque(maxlen=10)
+
+        self.last_announced = {}
+        self.frame_count = 0
+
+    # ==================================================
+    # ANNOUNCEMENT SYSTEM
+    # ==================================================
+
+    def announce(self, detections):
+
+        now = time.time()
+
+        announcements = []
+        announced_keys = set()
+
+        for item in detections:
+
+            name = item["name"]
+            position = item["position"]
+            confidence = item["confidence"]
+
+            key = (name, position)
+
+            previous_time = self.last_announced.get(
+                key, 0
+            )
+
+            if now - previous_time >= VOICE_COOLDOWN:
+
+                if position == "centre":
+                    direction = "ahead"
+                else:
+                    direction = "to your " + position
+
+                if confidence > 0.80:
+
+                    article = (
+                        "an" if name[0].lower() in "aeiou"
+                        else "a"
+                    )
+
+                    message = (
+                        f"{article.capitalize()} {name} "
+                        f"is {direction}."
+                    )
+
+                else:
+
+                    message = (
+                        f"There appears to be a {name} "
+                        f"{direction}."
+                    )
+
+                announcements.append(message)
+                announced_keys.add(key)
+
+            if len(announcements) >= 4:
+                break
+
+        if announcements:
+
+            message = " ".join(announcements)
+
+            with self.lock:
+
+                self.speech_queue.append(message)
+
+            for key in announced_keys:
+
+                self.last_announced[key] = now
+
+    # ==================================================
+    # CAMERA FRAME PROCESSING
+    # ==================================================
 
     def recv(self, frame):
 
-        image = frame.to_ndarray(format="bgr24")
+        img = frame.to_ndarray(format="bgr24")
 
-        results = self.model.predict(
-            image,
-            imgsz=640,
-            conf=0.30,
-            verbose=False
-        )
+        self.frame_count += 1
 
-        annotated = image.copy()
-        detected_objects = []
+        # Process every second frame
+        if self.frame_count % 2 == 0:
 
-        for result in results:
+            results = model.predict(
+                img,
+                imgsz=IMAGE_SIZE,
+                conf=CONFIDENCE,
+                verbose=False
+            )
 
-            boxes = result.boxes
+            detections = []
 
-            if boxes is None:
-                continue
+            for result in results:
 
-            for box in boxes:
+                for box in result.boxes:
 
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
+                    class_id = int(box.cls[0])
 
-                name = self.model.names[class_id]
+                    name = model.names[class_id]
 
-                if name not in TARGET_OBJECTS:
-                    continue
+                    if name not in TARGET_OBJECTS:
+                        continue
 
-                x1, y1, x2, y2 = map(
-                    int,
-                    box.xyxy[0]
-                )
+                    confidence = float(box.conf[0])
 
-                detected_objects.append(name)
+                    x1, y1, x2, y2 = map(
+                        int,
+                        box.xyxy[0].tolist()
+                    )
 
-                # Draw bounding box
-                cv2.rectangle(
-                    annotated,
-                    (x1, y1),
-                    (x2, y2),
-                    (0, 255, 100),
-                    3
-                )
+                    center = (x1 + x2) / 2
 
-                label = f"{name} {confidence:.0%}"
+                    if center < img.shape[1] / 3:
 
-                cv2.putText(
-                    annotated,
-                    label,
-                    (x1, max(y1 - 10, 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 100),
-                    2
-                )
+                        position = "left"
 
-        self.detections = list(set(detected_objects))
+                    elif center > img.shape[1] * 2 / 3:
+
+                        position = "right"
+
+                    else:
+
+                        position = "centre"
+
+                    detections.append({
+
+                        "name": name,
+
+                        "position": position,
+
+                        "confidence": round(
+                            confidence, 2
+                        )
+
+                    })
+
+                    # Draw bounding box
+                    cv2.rectangle(
+                        img,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0),
+                        2
+                    )
+
+                    label = (
+                        f"{name} "
+                        f"{confidence:.2f} "
+                        f"- {position}"
+                    )
+
+                    cv2.putText(
+                        img,
+                        label,
+                        (x1, max(25, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 0),
+                        2
+                    )
+
+            # Update detections
+            with self.lock:
+
+                self.detections = detections
+
+            # Voice announcements
+            if detections:
+
+                self.announce(detections)
 
         return av.VideoFrame.from_ndarray(
-            annotated,
+            img,
             format="bgr24"
         )
 
-# =========================
-# HEADER
-# =========================
+    # ==================================================
+    # GET DETECTIONS
+    # ==================================================
+
+    def get_detections(self):
+
+        with self.lock:
+
+            return list(self.detections)
+
+    # ==================================================
+    # GET SPEECH
+    # ==================================================
+
+    def get_speech(self):
+
+        with self.lock:
+
+            if self.speech_queue:
+
+                return self.speech_queue.popleft()
+
+            return None
+
+
+# ==================================================
+# INTERFACE DESIGN
+# ==================================================
+
+st.markdown("""
+<style>
+
+.main-title {
+    font-size: 34px;
+    font-weight: 750;
+    margin-bottom: 0;
+}
+
+.subtitle {
+    color: #888888;
+    font-size: 15px;
+    margin-bottom: 25px;
+}
+
+</style>
+""", unsafe_allow_html=True)
 
 st.markdown(
     '<div class="main-title">👁️ VisionGuide AI</div>',
@@ -176,128 +280,172 @@ st.markdown(
 )
 
 st.markdown(
-    '<div class="subtitle">AI-powered visual assistance prototype</div>',
+    '<div class="subtitle">'
+    'AI-powered object detection assistant'
+    '</div>',
     unsafe_allow_html=True
 )
 
 st.divider()
 
-# =========================
-# PRIVACY WARNING
-# =========================
+# ==================================================
+# DASHBOARD
+# ==================================================
 
-st.markdown("""
-<div class="warning-box">
-⚠️ <b>Privacy Notice:</b> Camera images are sent to the VisionGuide server
-for AI processing. Start the camera only if you agree.
-<br><br>
-This is an experimental prototype. Do not rely on it for navigation or safety.
-</div>
-""", unsafe_allow_html=True)
+left, right = st.columns(
+    [2, 1],
+    gap="large"
+)
 
-st.write("")
+# ==================================================
+# LEFT SIDE: CAMERA
+# ==================================================
 
-# =========================
-# CAMERA SECTION
-# =========================
+with left:
 
-st.subheader("📷 Live Camera")
+    st.subheader("📷 Live Camera")
 
-if not model_loaded:
-
-    st.error("YOLO model could not be loaded.")
-
-else:
-
-    rtc_configuration = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    )
-
-    camera = webrtc_streamer(
+    ctx = webrtc_streamer(
         key="visionguide-camera",
-        video_processor_factory=VisionProcessor,
-        rtc_configuration=rtc_configuration,
+
+        video_processor_factory=VisionGuideProcessor,
+
+        rtc_configuration=RTCConfiguration({
+            "iceServers": [
+                {
+                    "urls": [
+                        "stun:stun.l.google.com:19302"
+                    ]
+                }
+            ]
+        }),
+
         media_stream_constraints={
             "video": True,
             "audio": False
         },
-        async_processing=False
+
+        async_processing=True
     )
 
-# =========================
-# DETECTION INFORMATION
-# =========================
+    st.caption(
+        "Click Start to activate your camera "
+        "and begin object detection."
+    )
 
-st.divider()
+# ==================================================
+# RIGHT SIDE: DASHBOARD
+# ==================================================
 
-col1, col2 = st.columns([2, 1])
+@st.fragment(run_every=0.5)
+def dashboard():
 
-with col1:
+    with right:
 
-    st.subheader("🔍 Detection Information")
+        st.subheader("Controls")
 
-    if model_loaded and camera.video_processor:
+        if ctx.state.playing:
 
-        detections = camera.video_processor.detections
+            st.success("Detection is running")
 
-        if detections:
+        else:
 
-            for item in detections:
+            st.warning("Detection is stopped")
 
-                st.markdown(
+        st.caption(
+            "Use the camera Start/Stop button "
+            "to control detection."
+        )
+
+        st.divider()
+
+        st.subheader("🔊 Voice Assistant")
+
+        st.write("Voice announcements: Enabled")
+
+        st.caption(
+            "Browser speech synthesis"
+        )
+
+        st.divider()
+
+        st.subheader("Detected Objects")
+
+        if ctx.video_processor:
+
+            detections = (
+                ctx.video_processor.get_detections()
+            )
+
+            if detections:
+
+                for item in detections:
+
+                    st.write(
+                        f"**{item['name'].title()}**"
+                        f" · {item['position'].title()}"
+                        f" · {item['confidence']:.0%}"
+                    )
+
+            else:
+
+                st.caption(
+                    "No objects detected yet."
+                )
+
+            # Speech announcement
+            message = ctx.video_processor.get_speech()
+
+            if message:
+
+                escaped_message = (
+                    message
+                    .replace("\\", "\\\\")
+                    .replace("'", "\\'")
+                    .replace("\n", " ")
+                )
+
+                st.components.v1.html(
                     f"""
-                    <div class="detected-box">
-                    🟢 <b>{item.capitalize()}</b> detected
-                    </div>
+                    <script>
+                    const speech =
+                        new SpeechSynthesisUtterance(
+                            '{escaped_message}'
+                        );
+
+                    speech.rate = 1;
+                    speech.volume = 1;
+
+                    window.speechSynthesis.cancel();
+                    window.speechSynthesis.speak(speech);
+                    </script>
                     """,
-                    unsafe_allow_html=True
+                    height=0
                 )
 
         else:
 
-            st.info(
-                "No target objects detected currently."
+            st.caption(
+                "Start the camera to detect objects."
             )
 
-    else:
+        st.divider()
 
-        st.info(
-            "Start the camera to begin object detection."
+        st.caption(
+            f"Supported classes: "
+            f"{len(TARGET_OBJECTS)}"
         )
 
-with col2:
+        st.caption(
+            f"Detection image size: {IMAGE_SIZE}"
+        )
 
-    st.subheader("⚙️ System Status")
-
-    if model_loaded:
-
-        st.success("YOLO Model Loaded")
-
-    else:
-
-        st.error("Model Not Loaded")
-
-    if camera.state.playing:
-
-        st.success("Camera Running")
-
-    else:
-
-        st.info("Camera Stopped")
-
-    st.caption(
-        "Detection runs on the server."
-    )
-
-# =========================
-# FOOTER
-# =========================
+dashboard()
 
 st.divider()
 
-st.caption("""
-VisionGuide AI | Experimental AI visual assistance prototype
-
-Not a replacement for a cane, guide dog, trained mobility assistance,
-or human assistance. Detection can be incorrect or delayed.
-""")
+st.caption(
+    "VisionGuide AI is an experimental object "
+    "detection assistant. Do not rely on it "
+    "for safe navigation."
+)
