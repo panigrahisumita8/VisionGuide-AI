@@ -5,8 +5,10 @@ import cv2
 import time
 import json
 import threading
-from collections import defaultdict, deque
+import queue
+import av
 
+from collections import defaultdict, deque
 from ultralytics import YOLO
 from streamlit_webrtc import (
     webrtc_streamer,
@@ -14,9 +16,9 @@ from streamlit_webrtc import (
     WebRtcMode,
 )
 
-# --------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------
+# ==================================================
+# 1. CONFIGURATION
+# ==================================================
 
 st.set_page_config(
     page_title="VisionGuide AI",
@@ -26,15 +28,15 @@ st.set_page_config(
 )
 
 MODEL_PATH = "weights.pt"
-IMAGE_SIZE = 640
+IMAGE_SIZE = 416
 CONFIDENCE = 0.45
-MAX_DETECTIONS = 20
+MAX_DETECTIONS = 15
 ANNOUNCEMENT_COOLDOWN = 6
 STABILITY_FRAMES = 3
 
-# --------------------------------------------------
-# CUSTOM GUI
-# --------------------------------------------------
+# ==================================================
+# 2. GUI DESIGN
+# ==================================================
 
 st.markdown("""
 <style>
@@ -57,11 +59,6 @@ div[data-testid="stMetric"] {
     padding: 16px;
     border-radius: 12px;
 }
-div[data-testid="stVerticalBlockBorderWrapper"] {
-    background: #111a2b;
-    border: 1px solid #29354c;
-    border-radius: 12px;
-}
 .stButton button {
     border-radius: 9px;
 }
@@ -71,13 +68,14 @@ hr {
 </style>
 """, unsafe_allow_html=True)
 
-# --------------------------------------------------
-# MODEL LOADING
-# --------------------------------------------------
+# ==================================================
+# 3. LOAD CUSTOM MODEL
+# ==================================================
 
 @st.cache_resource
 def load_model():
-    return YOLO(MODEL_PATH)
+    model = YOLO(MODEL_PATH)
+    return model
 
 try:
     model = load_model()
@@ -88,37 +86,37 @@ try:
 
 except Exception as error:
     st.error(f"Model loading failed: {error}")
-    st.info("Check that weights.pt is present in the repository root.")
     st.stop()
 
-# --------------------------------------------------
-# HEADER
-# --------------------------------------------------
+# ==================================================
+# 4. HEADER
+# ==================================================
 
 st.markdown("# 👁️ VisionGuide AI")
 st.markdown("### Real-time visual assistance prototype")
-st.caption("AI-powered object recognition and voice-based scene descriptions")
+st.caption("AI-powered object recognition and voice assistance")
 
 st.divider()
 
-# --------------------------------------------------
-# SIDEBAR
-# --------------------------------------------------
+# ==================================================
+# 5. SIDEBAR
+# ==================================================
 
 with st.sidebar:
+
     st.markdown("## 👁️ VisionGuide")
     st.caption("AI Vision Assistant")
 
     st.divider()
 
-    st.markdown("### ⚙️ Detection settings")
+    st.markdown("### Detection settings")
 
     confidence = st.slider(
         "Detection confidence",
-        min_value=0.20,
-        max_value=0.90,
-        value=CONFIDENCE,
-        step=0.05
+        0.20,
+        0.90,
+        CONFIDENCE,
+        0.05
     )
 
     voice_enabled = st.toggle(
@@ -128,171 +126,257 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown("### 🧠 Model information")
+    st.markdown("### Model information")
 
     st.success("Custom YOLO model loaded")
 
     st.metric("Trained classes", len(class_names))
 
     st.caption("Checkpoint: weights.pt")
-    st.caption("Input size: 640 × 640")
+    st.caption("Image size: 416")
 
     st.divider()
 
     st.caption("VisionGuide AI | Experimental prototype")
 
-# --------------------------------------------------
-# VIDEO PROCESSOR
-# --------------------------------------------------
+# ==================================================
+# 6. BACKGROUND VIDEO PROCESSOR
+# ==================================================
 
 class VisionGuideProcessor(VideoProcessorBase):
 
-    def __init__(self):
+    def __init__(self, confidence_value):
+
         self.model = model
+        self.confidence = confidence_value
+
         self.lock = threading.Lock()
 
+        # Queue holds only the newest frame
+        self.frame_queue = queue.Queue(maxsize=1)
+
+        self.latest_image = None
+        self.latest_detections = []
+        self.latest_message = ""
+
+        self.message_id = 0
+        self.last_error = ""
+
         self.frame_count = 0
+
         self.history = defaultdict(
             lambda: deque(maxlen=5)
         )
 
         self.last_spoken = {}
 
-        self.latest_detections = []
-        self.latest_message = ""
-        self.message_id = 0
-        self.last_error = ""
+        # Start background AI worker
+        self.worker = threading.Thread(
+            target=self.detection_worker,
+            daemon=True
+        )
+
+        self.worker.start()
+
+    # ------------------------------------------------
+    # CAMERA THREAD: NEVER WAIT FOR YOLO
+    # ------------------------------------------------
 
     def recv(self, frame):
 
         image = frame.to_ndarray(format="bgr24")
+
         self.frame_count += 1
 
-        # Process every second frame to reduce CPU load
-        if self.frame_count % 2 != 0:
-            return frame
-
+        # Send newest frame to background worker
         try:
-            results = self.model.predict(
-                image,
-                imgsz=IMAGE_SIZE,
-                conf=confidence,
-                max_det=MAX_DETECTIONS,
-                verbose=False
-            )
+            self.frame_queue.put_nowait(image.copy())
 
-            height, width = image.shape[:2]
+        except queue.Full:
 
-            detections = []
-            present_objects = set()
+            # Remove old frame
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
 
-            for result in results:
+            try:
+                self.frame_queue.put_nowait(image.copy())
+            except queue.Full:
+                pass
 
-                if result.boxes is None:
-                    continue
+        # Read latest processed image
+        with self.lock:
 
-                for box in result.boxes:
+            if self.latest_image is not None:
+                output = self.latest_image.copy()
+            else:
+                output = image
 
-                    class_id = int(box.cls[0].item())
-                    score = float(box.conf[0].item())
-
-                    # Use the checkpoint's original class mapping
-                    label = str(self.model.names[class_id])
-
-                    x1, y1, x2, y2 = map(
-                        int, box.xyxy[0].tolist()
-                    )
-
-                    # Determine approximate screen position
-                    center_x = (x1 + x2) / 2
-
-                    if center_x < width * 0.35:
-                        position = "left"
-                    elif center_x > width * 0.65:
-                        position = "right"
-                    else:
-                        position = "ahead"
-
-                    detections.append({
-                        "name": label,
-                        "class_id": class_id,
-                        "confidence": score,
-                        "position": position
-                    })
-
-                    present_objects.add((label, position))
-
-                    # Draw detection box
-                    cv2.rectangle(
-                        image,
-                        (x1, y1),
-                        (x2, y2),
-                        (0, 220, 130),
-                        2
-                    )
-
-                    text = f"{label} {score:.0%}"
-
-                    cv2.putText(
-                        image,
-                        text,
-                        (x1, max(y1 - 10, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 220, 130),
-                        2
-                    )
-
-            # Update stability history
-            all_keys = set(self.history.keys()) | present_objects
-
-            for key in all_keys:
-                self.history[key].append(
-                    1 if key in present_objects else 0
-                )
-
-            # Prepare voice announcements
-            current_time = time.time()
-            new_message = None
-
-            for label, position in present_objects:
-
-                key = (label, position)
-
-                if sum(self.history[key]) < STABILITY_FRAMES:
-                    continue
-
-                last_time = self.last_spoken.get(key, 0)
-
-                if current_time - last_time < ANNOUNCEMENT_COOLDOWN:
-                    continue
-
-                new_message = f"{label} on your {position}"
-                self.last_spoken[key] = current_time
-                break
-
-            with self.lock:
-
-                self.latest_detections = detections
-                self.last_error = ""
-
-                if new_message:
-                    self.latest_message = new_message
-                    self.message_id += 1
-
-        except Exception as error:
-
-            with self.lock:
-                self.last_error = str(error)
-
-        return frame.from_ndarray(
-            image,
+        # Return immediately, without waiting for YOLO
+        return av.VideoFrame.from_ndarray(
+            output,
             format="bgr24"
         )
+
+    # ------------------------------------------------
+    # BACKGROUND DETECTION WORKER
+    # ------------------------------------------------
+
+    def detection_worker(self):
+
+        while True:
+
+            try:
+                image = self.frame_queue.get(timeout=2)
+
+            except queue.Empty:
+                continue
+
+            try:
+                annotated, detections, message = (
+                    self.process_image(image)
+                )
+
+                with self.lock:
+
+                    self.latest_image = annotated
+                    self.latest_detections = detections
+                    self.last_error = ""
+
+                    if message:
+
+                        self.latest_message = message
+                        self.message_id += 1
+
+            except Exception as error:
+
+                with self.lock:
+                    self.last_error = str(error)
+
+    # ------------------------------------------------
+    # YOLO INFERENCE
+    # ------------------------------------------------
+
+    def process_image(self, image):
+
+        height, width = image.shape[:2]
+
+        results = self.model.predict(
+            image,
+            imgsz=IMAGE_SIZE,
+            conf=self.confidence,
+            max_det=MAX_DETECTIONS,
+            verbose=False
+        )
+
+        detections = []
+        present_objects = set()
+
+        annotated = image.copy()
+
+        for result in results:
+
+            if result.boxes is None:
+                continue
+
+            for box in result.boxes:
+
+                class_id = int(box.cls[0].item())
+                score = float(box.conf[0].item())
+
+                # Use actual checkpoint class names
+                label = str(self.model.names[class_id])
+
+                x1, y1, x2, y2 = map(
+                    int,
+                    box.xyxy[0].tolist()
+                )
+
+                # Approximate screen position
+                center_x = (x1 + x2) / 2
+
+                if center_x < width * 0.35:
+                    position = "left"
+
+                elif center_x > width * 0.65:
+                    position = "right"
+
+                else:
+                    position = "ahead"
+
+                detections.append({
+                    "name": label,
+                    "class_id": class_id,
+                    "confidence": score,
+                    "position": position
+                })
+
+                present_objects.add((label, position))
+
+                # Draw bounding boxes
+                cv2.rectangle(
+                    annotated,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 220, 130),
+                    2
+                )
+
+                cv2.putText(
+                    annotated,
+                    f"{label} {score:.0%}",
+                    (x1, max(y1 - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 220, 130),
+                    2
+                )
+
+        # Update detection stability
+        all_keys = set(self.history.keys()) | present_objects
+
+        for key in all_keys:
+
+            self.history[key].append(
+                1 if key in present_objects else 0
+            )
+
+        # Generate voice announcement
+        message = None
+        current_time = time.time()
+
+        for label, position in present_objects:
+
+            key = (label, position)
+
+            if sum(self.history[key]) < STABILITY_FRAMES:
+                continue
+
+            last_time = self.last_spoken.get(key, 0)
+
+            if (
+                current_time - last_time
+                < ANNOUNCEMENT_COOLDOWN
+            ):
+                continue
+
+            message = f"{label} on your {position}"
+
+            self.last_spoken[key] = current_time
+
+            break
+
+        return annotated, detections, message
+
+    # ------------------------------------------------
+    # SHARE DATA WITH STREAMLIT
+    # ------------------------------------------------
 
     def get_data(self):
 
         with self.lock:
+
             return (
                 list(self.latest_detections),
                 self.latest_message,
@@ -300,55 +384,66 @@ class VisionGuideProcessor(VideoProcessorBase):
                 self.last_error
             )
 
-# --------------------------------------------------
-# MAIN DASHBOARD
-# --------------------------------------------------
+
+# ==================================================
+# 7. CAMERA INTERFACE
+# ==================================================
 
 left, right = st.columns([2, 1])
 
 with left:
+
     st.markdown("## 📷 Live camera")
-    st.caption("Allow camera access when your browser asks.")
+    st.caption("Start the camera and allow browser permission.")
 
 with right:
-    st.markdown("## 🎙️ Voice assistant")
-    st.caption(
-        "Voice announcements are approximate screen positions, "
-        "not distance measurements."
-    )
 
-# --------------------------------------------------
-# WEBRTC CAMERA
-# --------------------------------------------------
+    st.markdown("## 🎙️ Voice assistant")
+    st.caption("Real-time object announcements")
 
 ctx = webrtc_streamer(
     key="visionguide-live-camera",
     mode=WebRtcMode.SENDRECV,
-    video_processor_factory=VisionGuideProcessor,
+
+    video_processor_factory=lambda: VisionGuideProcessor(
+        confidence
+    ),
+
     media_stream_constraints={
         "video": True,
         "audio": False
     },
+
     async_processing=True,
+
     rtc_configuration={
         "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]}
+            {
+                "urls": [
+                    "stun:stun.l.google.com:19302"
+                ]
+            }
         ]
     }
 )
 
 st.divider()
 
-# --------------------------------------------------
-# LIVE DASHBOARD
-# --------------------------------------------------
+# ==================================================
+# 8. LIVE DASHBOARD
+# ==================================================
 
-@st.fragment(run_every=0.7)
+@st.fragment(run_every=1.0)
 def live_dashboard():
 
-    if not ctx.state.playing or ctx.video_processor is None:
+    if (
+        not ctx.state.playing
+        or ctx.video_processor is None
+    ):
 
-        st.info("📷 Start the camera above to begin object detection.")
+        st.info(
+            "📷 Start your camera above to begin detection."
+        )
 
         col1, col2, col3 = st.columns(3)
 
@@ -365,11 +460,15 @@ def live_dashboard():
     if error:
         st.error(f"Detection error: {error}")
 
-    # Status metrics
     col1, col2, col3 = st.columns(3)
 
     col1.metric("Camera", "Active")
-    col2.metric("Objects detected", len(detections))
+
+    col2.metric(
+        "Objects detected",
+        len(detections)
+    )
+
     col3.metric(
         "Voice assistant",
         "Enabled" if voice_enabled else "Disabled"
@@ -377,19 +476,21 @@ def live_dashboard():
 
     st.divider()
 
-    # Latest announcement
+    # Latest voice announcement
     st.markdown("### 🔊 Latest announcement")
 
     if message:
         st.info(f"🗣️ {message}")
     else:
-        st.write("Waiting for a stable object detection...")
+        st.write("Waiting for object detection...")
 
-    # Speak only new announcements
+    # Browser speech
     if (
         voice_enabled
         and message
-        and message_id != st.session_state.get("last_message_id", -1)
+        and message_id != st.session_state.get(
+            "last_message_id", -1
+        )
     ):
 
         st.session_state.last_message_id = message_id
@@ -400,9 +501,12 @@ def live_dashboard():
             const message = {json.dumps(message)};
 
             if ("speechSynthesis" in window) {{
+
                 window.speechSynthesis.cancel();
 
-                const speech = new SpeechSynthesisUtterance(message);
+                const speech =
+                    new SpeechSynthesisUtterance(message);
+
                 speech.rate = 0.95;
                 speech.pitch = 1;
                 speech.volume = 1;
@@ -416,7 +520,7 @@ def live_dashboard():
 
     st.divider()
 
-    # Detection list
+    # Object detection list
     st.markdown("### 🎯 Detected objects")
 
     if detections:
@@ -440,44 +544,47 @@ def live_dashboard():
                 )
 
                 st.caption(
-                    f"Approximate position: {item['position'].title()}"
+                    f"Position: {item['position'].title()}"
                 )
 
     else:
-        st.info("No objects detected in the latest processed frame.")
+
+        st.info(
+            "No objects detected in the latest processed frame."
+        )
+
 
 live_dashboard()
 
-# --------------------------------------------------
-# MODEL CLASS INFORMATION
-# --------------------------------------------------
+# ==================================================
+# 9. MODEL CLASSES
+# ==================================================
 
 st.divider()
 
-with st.expander("🧠 View all trained model classes"):
+with st.expander("🧠 View all 68 trained classes"):
 
-    st.caption(
-        "Class IDs and names are read directly from weights.pt."
-    )
-
-    class_columns = st.columns(3)
+    columns = st.columns(3)
 
     for index, (class_id, class_name) in enumerate(
         class_names.items()
     ):
 
-        with class_columns[index % 3]:
-            st.write(f"**{class_id}** · {class_name}")
+        with columns[index % 3]:
 
-# --------------------------------------------------
-# FOOTER
-# --------------------------------------------------
+            st.write(
+                f"**{class_id}** · {class_name}"
+            )
+
+# ==================================================
+# 10. FOOTER
+# ==================================================
 
 st.divider()
 
 st.caption(
     "VisionGuide AI is an experimental educational prototype. "
-    "It can make incorrect detections and cannot measure distance "
-    "or guarantee obstacle avoidance. Do not rely on it as a "
-    "substitute for a mobility aid or human assistance."
+    "It may make incorrect detections and cannot measure distance "
+    "or guarantee obstacle avoidance. Do not use it as a substitute "
+    "for a mobility aid or human assistance."
 )
