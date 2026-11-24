@@ -23,7 +23,7 @@ st.set_page_config(
     layout="wide"
 )
 
-MODEL_PATH = "weights(1).pt"
+MODEL_PATH = "weights.pt"
 
 IMAGE_SIZE = 640
 CONFIDENCE = 0.50
