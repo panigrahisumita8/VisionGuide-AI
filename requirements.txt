@@ -1,6 +1,6 @@
 streamlit>=1.37
 streamlit-webrtc>=0.47
-rfdetr
-opencv-python-headless>=4.9
-av>=12
-huggingface_hub
+ultralytics
+opencv-python-headless
+av
+numpy
