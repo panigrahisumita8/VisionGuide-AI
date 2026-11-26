@@ -1,3 +1,4 @@
+
 import json
 import os
 import threading
@@ -14,6 +15,56 @@ from ultralytics import YOLO
 
 st.set_page_config(page_title="VisionGuide AI", page_icon="👁️", layout="wide")
 
+
+# ============================================================
+# FIREBASE / GOOGLE ANALYTICS
+# ============================================================
+
+FIREBASE_MEASUREMENT_ID = "G-XSHL6SPZ9G"
+
+st.html(
+    f"""
+    <script>
+    (function () {{
+        if (window.__visionguideFirebaseAnalyticsLoaded) return;
+
+        window.__visionguideFirebaseAnalyticsLoaded = true;
+
+        var measurementId = "{FIREBASE_MEASUREMENT_ID}";
+        var script = document.createElement("script");
+
+        script.async = true;
+        script.src =
+            "https://www.googletagmanager.com/gtag/js?id=" + measurementId;
+
+        document.head.appendChild(script);
+
+        window.dataLayer = window.dataLayer || [];
+
+        function gtag() {{
+            window.dataLayer.push(arguments);
+        }}
+
+        window.gtag = gtag;
+
+        gtag("js", new Date());
+
+        gtag("config", measurementId, {{
+            send_page_view: true,
+            page_title: "VisionGuide AI",
+            page_location: window.top.location.href
+        }});
+    }})();
+    </script>
+    """,
+    unsafe_allow_javascript=True,
+)
+
+
+# ============================================================
+# CUSTOM DASHBOARD DESIGN
+# ============================================================
+
 st.markdown("""
 <style>
 .stApp {background:#0b1020;color:#f1f5f9}
@@ -27,9 +78,22 @@ hr {border-color:#29354c}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="vg-title">👁️ VisionGuide AI</div>', unsafe_allow_html=True)
-st.markdown('<div class="vg-subtitle">AI-powered object detection assistant</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="vg-title">👁️ VisionGuide AI</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="vg-subtitle">AI-powered object detection assistant</div>',
+    unsafe_allow_html=True
+)
+
 st.divider()
+
+
+# ============================================================
+# MODEL SETTINGS
+# ============================================================
 
 MODEL_PATH = os.getenv("VISIONGUIDE_MODEL", "weights.pt")
 IMAGE_SIZE = 416
@@ -38,23 +102,45 @@ VOICE_COOLDOWN = 7
 STABILITY_REQUIRED = 2
 MAX_DETECTIONS = 25
 
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
 with st.sidebar:
     st.markdown("## 👁️ VisionGuide")
     st.caption("AI Vision Assistant")
     st.divider()
+
     st.markdown("### Detection settings")
+
     confidence_setting = st.slider(
-        "Detection confidence", 0.15, 0.90, DEFAULT_CONFIDENCE, 0.05
+        "Detection confidence",
+        0.15,
+        0.90,
+        DEFAULT_CONFIDENCE,
+        0.05
     )
-    voice_enabled = st.toggle("Voice announcements", value=True)
+
+    voice_enabled = st.toggle(
+        "Voice announcements",
+        value=True
+    )
+
     st.divider()
+
     st.markdown("### Model information")
     st.caption(f"Checkpoint: `{MODEL_PATH}`")
     st.caption(f"Inference image size: {IMAGE_SIZE}px")
     st.caption("Background AI processing")
+
     st.divider()
     st.caption("VisionGuide AI | Experimental prototype")
 
+
+# ============================================================
+# LOAD YOLO MODEL
+# ============================================================
 
 @st.cache_resource(show_spinner="Loading trained VisionGuide model...")
 def load_model(model_path):
@@ -62,18 +148,26 @@ def load_model(model_path):
         raise FileNotFoundError(
             f"'{model_path}' was not found. Keep weights.pt beside streamlit_app.py."
         )
+
     return YOLO(model_path)
 
 
 try:
     model = load_model(MODEL_PATH)
+
     class_names = model.names
+
     if isinstance(class_names, list):
         class_names = dict(enumerate(class_names))
+
 except Exception as exc:
     st.error(f"Could not load the trained model: {exc}")
     st.stop()
 
+
+# ============================================================
+# VISIONGUIDE CAMERA PROCESSOR
+# ============================================================
 
 class VisionGuideProcessor:
     """Keeps camera output live while a worker performs YOLO inference."""
@@ -81,25 +175,34 @@ class VisionGuideProcessor:
     def __init__(self, yolo_model, confidence_value):
         self.model = yolo_model
         self.confidence = confidence_value
+
         self.lock = threading.Lock()
         self.queue_lock = threading.Lock()
+
         self.latest_frame = None
         self.boxes_for_display = []
         self.detections = []
+
         self.last_announcement = ""
         self.announcement_id = ""
+
         self.last_announced_at = {}
+
         self.stability = defaultdict(lambda: deque(maxlen=4))
+
         self.error = ""
         self.inference_count = 0
         self.last_inference_time = 0.0
+
         self.worker = threading.Thread(
-            target=self.detection_worker, daemon=True
+            target=self.detection_worker,
+            daemon=True
         )
+
         self.worker.start()
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # Always return the newest camera frame, never an old inference frame.
+
         image = frame.to_ndarray(format="bgr24")
 
         with self.queue_lock:
@@ -113,7 +216,9 @@ class VisionGuideProcessor:
         h, w = output.shape[:2]
 
         for item in boxes:
+
             x1, y1, x2, y2 = item["box"]
+
             sx = w / max(1, item["frame_width"])
             sy = h / max(1, item["frame_height"])
 
@@ -121,7 +226,11 @@ class VisionGuideProcessor:
             y1, y2 = int(y1 * sy), int(y2 * sy)
 
             cv2.rectangle(
-                output, (x1, y1), (x2, y2), (0, 220, 130), 2
+                output,
+                (x1, y1),
+                (x2, y2),
+                (0, 220, 130),
+                2
             )
 
             cv2.putText(
@@ -134,10 +243,15 @@ class VisionGuideProcessor:
                 2
             )
 
-        return av.VideoFrame.from_ndarray(output, format="bgr24")
+        return av.VideoFrame.from_ndarray(
+            output,
+            format="bgr24"
+        )
 
     def detection_worker(self):
+
         while True:
+
             with self.queue_lock:
                 image = self.latest_frame
                 self.latest_frame = None
@@ -147,6 +261,7 @@ class VisionGuideProcessor:
                 continue
 
             try:
+
                 height, width = image.shape[:2]
 
                 results = self.model.predict(
@@ -163,24 +278,30 @@ class VisionGuideProcessor:
                 present_keys = set()
 
                 for result in results:
+
                     if result.boxes is None:
                         continue
 
                     for box in result.boxes:
+
                         class_id = int(box.cls[0].item())
                         score = float(box.conf[0].item())
+
                         name = str(self.model.names[class_id])
 
                         x1, y1, x2, y2 = map(
-                            int, box.xyxy[0].tolist()
+                            int,
+                            box.xyxy[0].tolist()
                         )
 
                         center_x = (x1 + x2) / 2
 
                         if center_x < width / 3:
                             position = "left"
+
                         elif center_x > width * 2 / 3:
                             position = "right"
+
                         else:
                             position = "centre"
 
@@ -202,17 +323,19 @@ class VisionGuideProcessor:
                         present_keys.add((class_id, position))
 
                 now = time.time()
+
                 all_keys = set(self.stability.keys()) | present_keys
 
                 for key in all_keys:
+
                     self.stability[key].append(
                         1 if key in present_keys else 0
                     )
 
-                # Announce all newly eligible objects, not just the first one.
                 announcements = []
 
                 for class_id, position in sorted(present_keys):
+
                     key = (class_id, position)
 
                     if sum(self.stability[key]) < STABILITY_REQUIRED:
@@ -229,16 +352,22 @@ class VisionGuideProcessor:
 
                     self.last_announced_at[key] = now
 
-                announcements = list(dict.fromkeys(announcements))[:4]
+                announcements = list(
+                    dict.fromkeys(announcements)
+                )[:4]
 
                 with self.lock:
+
                     self.detections = current_detections
                     self.boxes_for_display = current_boxes
+
                     self.error = ""
+
                     self.inference_count += 1
                     self.last_inference_time = time.time()
 
                     if announcements:
+
                         self.last_announcement = ". ".join(
                             announcements
                         ) + "."
@@ -246,11 +375,14 @@ class VisionGuideProcessor:
                         self.announcement_id = str(uuid.uuid4())
 
             except Exception as exc:
+
                 with self.lock:
                     self.error = str(exc)
 
     def snapshot(self):
+
         with self.lock:
+
             return (
                 list(self.detections),
                 self.last_announcement,
@@ -261,13 +393,19 @@ class VisionGuideProcessor:
             )
 
 
+# ============================================================
+# BROWSER VOICE ANNOUNCEMENTS
+# ============================================================
+
 def speak_in_browser(message: str, event_id: str):
+
     html = f"""
     <script>
     const message = {json.dumps(message)};
     const eventId = {json.dumps(event_id)};
 
     if (message && eventId && "speechSynthesis" in window) {{
+
         const key = "visionguide_last_spoken_event";
         let previous = "";
 
@@ -276,11 +414,13 @@ def speak_in_browser(message: str, event_id: str):
         }} catch(e) {{}}
 
         if (eventId !== previous) {{
+
             try {{
                 window.sessionStorage.setItem(key, eventId);
             }} catch(e) {{}}
 
             const utterance = new SpeechSynthesisUtterance(message);
+
             utterance.lang = "en-US";
             utterance.rate = 1;
             utterance.pitch = 1;
@@ -291,8 +431,16 @@ def speak_in_browser(message: str, event_id: str):
     </script>
     """
 
-    components.html(html, height=0, width=0)
+    components.html(
+        html,
+        height=0,
+        width=0
+    )
 
+
+# ============================================================
+# LIVE CAMERA
+# ============================================================
 
 st.subheader("📷 Live Camera")
 
@@ -304,19 +452,24 @@ st.warning(
 ctx = webrtc_streamer(
     key="visionguide-live-camera",
     mode=WebRtcMode.SENDRECV,
+
     video_processor_factory=lambda: VisionGuideProcessor(
-        model, confidence_setting
+        model,
+        confidence_setting
     ),
+
     media_stream_constraints={
         "video": True,
         "audio": False
     },
+
     async_processing=True,
+
     rtc_configuration={
         "iceServers": [
             {"urls": ["stun:stun.l.google.com:19302"]}
         ]
-    },
+    }
 )
 
 st.caption(
@@ -324,31 +477,58 @@ st.caption(
 )
 
 
+# ============================================================
+# LIVE DASHBOARD
+# ============================================================
+
 @st.fragment(run_every=1.0)
 def live_dashboard():
-    left, right = st.columns([2, 1], gap="large")
 
-    processor = ctx.video_processor if ctx.state.playing else None
+    left, right = st.columns(
+        [2, 1],
+        gap="large"
+    )
+
+    processor = (
+        ctx.video_processor
+        if ctx.state.playing
+        else None
+    )
 
     with left:
+
         st.subheader("Detection Preview")
 
         if ctx.state.playing:
+
             st.success("Camera connected")
+
             st.caption(
                 "The annotated live feed appears in the camera panel above."
             )
+
         else:
-            st.info("Camera is stopped. Start it in the panel above.")
+
+            st.info(
+                "Camera is stopped. Start it in the panel above."
+            )
 
     with right:
+
         st.subheader("System Status")
 
         if processor is not None:
-            st.success("VisionGuide is processing camera frames")
+
+            st.success(
+                "VisionGuide is processing camera frames"
+            )
+
         elif ctx.state.signalling:
+
             st.info("Connecting to camera...")
+
         else:
+
             st.warning("Camera is not running")
 
         st.divider()
@@ -360,11 +540,14 @@ def live_dashboard():
             + ("Enabled" if voice_enabled else "Disabled")
         )
 
-        st.caption("Uses the visitor's browser speech engine.")
+        st.caption(
+            "Uses the visitor's browser speech engine."
+        )
 
     st.divider()
 
     if processor is None:
+
         st.info("No active camera stream.")
         return
 
@@ -379,12 +562,21 @@ def live_dashboard():
 
     col1, col2, col3 = st.columns(3)
 
-    col1.metric("Objects detected", len(detections))
-    col2.metric("AI frames processed", count)
+    col1.metric(
+        "Objects detected",
+        len(detections)
+    )
+
+    col2.metric(
+        "AI frames processed",
+        count
+    )
 
     col3.metric(
         "Last AI update",
-        f"{time.time() - last_time:.1f}s ago" if last_time else "Waiting"
+        f"{time.time() - last_time:.1f}s ago"
+        if last_time
+        else "Waiting"
     )
 
     if error:
@@ -393,25 +585,39 @@ def live_dashboard():
     st.subheader("🔊 Latest Announcement")
 
     if announcement:
+
         st.info(announcement)
 
         if voice_enabled:
-            speak_in_browser(announcement, announcement_id)
+            speak_in_browser(
+                announcement,
+                announcement_id
+            )
+
     else:
-        st.caption("Waiting for stable object detections.")
+
+        st.caption(
+            "Waiting for stable object detections."
+        )
 
     st.subheader("🎯 Detected Objects")
 
     if detections:
+
         best_by_class = {}
 
         for item in detections:
-            key = (item["class_id"], item["position"])
+
+            key = (
+                item["class_id"],
+                item["position"]
+            )
 
             if (
                 key not in best_by_class
                 or item["confidence"] > best_by_class[key]["confidence"]
             ):
+
                 best_by_class[key] = item
 
         for item in sorted(
@@ -419,11 +625,14 @@ def live_dashboard():
             key=lambda x: x["confidence"],
             reverse=True
         ):
+
             st.write(
                 f'**{item["name"]}** · {item["position"].title()} '
                 f'· {item["confidence"]:.0%} · ID {item["class_id"]}'
             )
+
     else:
+
         st.caption(
             "No objects detected in the latest processed frame."
         )
@@ -431,18 +640,35 @@ def live_dashboard():
 
 live_dashboard()
 
+
+# ============================================================
+# TRAINED MODEL CLASSES
+# ============================================================
+
 st.divider()
 
 with st.expander("🧠 View trained model classes"):
+
     st.caption(
         "Class IDs and names are read directly from weights.pt."
     )
 
     columns = st.columns(3)
 
-    for index, (class_id, class_name) in enumerate(class_names.items()):
+    for index, (class_id, class_name) in enumerate(
+        class_names.items()
+    ):
+
         with columns[index % 3]:
-            st.write(f"**{class_id}** · {class_name}")
+
+            st.write(
+                f"**{class_id}** · {class_name}"
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
 
 st.divider()
 
